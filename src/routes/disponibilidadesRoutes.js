@@ -1,12 +1,13 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const { v4: uuidv4 } = require("uuid");
+const Disponibilidade = require("../models/Disponibilidade");
+const Reserva = require("../models/Reserva");
+const Sala = require("../models/Sala");
+const { randomUUID } = require("crypto");
+
+const authMiddleware = require("../middlewares/authMiddleware");
+const permissaoMiddleware = require("../middlewares/permissaoMiddleware");
 
 const router = express.Router();
-
-const dbPath = path.join(__dirname, "../db/disponibilidadeDB.json");
-const salasPath = path.join(__dirname, "../db/salasDB.json");
 
 const HORA_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
@@ -14,31 +15,9 @@ const HORA_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
 // FUNÇÕES AUXILIARES
 // ============================================
 
-function readFile(filePath) {
-  try {
-    const data = fs.readFileSync(filePath, "utf-8");
-    if (!data.trim()) return [];
-    return JSON.parse(data);
-  } catch (error) {
-    return [];
-  }
-}
-
-function readData() {
-  return readFile(dbPath);
-}
-
-function saveData(data) {
-  fs.writeFileSync(dbPath, JSON.stringify(data, null, 2), "utf-8");
-}
-
-function findSalaById(id) {
-  return readFile(salasPath).find((s) => s.id === id);
-}
-
 function timeToMinutes(time) {
   const [h, m] = String(time).split(":");
-  return Number(h) * 60 + Number(m || 0);
+  return Number(h) * 60 + Number(m);
 }
 
 function parseDia(value) {
@@ -93,8 +72,9 @@ function validarJanela({
   };
 }
 
-function findConflict(
-  disponibilidades,
+// Verifica conflitos somente com disponibilidades ativas.
+// Documentos antigos sem is_active são considerados ativos.
+async function findConflict(
   space_id,
   day_of_week,
   start_time,
@@ -104,18 +84,76 @@ function findConflict(
   const inicio = timeToMinutes(start_time);
   const fim = timeToMinutes(end_time);
 
+  const filtro = {
+    space_id,
+    day_of_week,
+    is_active: { $ne: false },
+    ...(ignoreId ? { id: { $ne: ignoreId } } : {}),
+  };
+
+  const disponibilidades = await Disponibilidade.find(filtro);
+
   return disponibilidades.find(
     (d) =>
-      d.id !== ignoreId &&
-      d.space_id === space_id &&
-      Number(d.day_of_week) === day_of_week &&
-      inicio < timeToMinutes(d.end_time) &&
-      fim > timeToMinutes(d.start_time),
+      inicio < timeToMinutes(d.end_time) && fim > timeToMinutes(d.start_time),
   );
 }
 
+// Verifica se alguma reserva utiliza o intervalo da disponibilidade.
+// Considera todos os status, inclusive CANCELLED e REJECTED.
+async function possuiReservaVinculada(disponibilidade) {
+  const reservas = await Reserva.find({
+    space_id: disponibilidade.space_id,
+  });
+
+  const inicioDisponibilidade = timeToMinutes(disponibilidade.start_time);
+  const fimDisponibilidade = timeToMinutes(disponibilidade.end_time);
+
+  return reservas.some((reserva) => {
+    const inicio = new Date(reserva.start_datetime);
+    const fim = new Date(reserva.end_datetime);
+
+    if (Number.isNaN(inicio.getTime()) || Number.isNaN(fim.getTime())) {
+      return false;
+    }
+
+    if (inicio.getDay() !== disponibilidade.day_of_week) {
+      return false;
+    }
+
+    if (
+      inicio.getFullYear() !== fim.getFullYear() ||
+      inicio.getMonth() !== fim.getMonth() ||
+      inicio.getDate() !== fim.getDate()
+    ) {
+      return false;
+    }
+
+    const inicioReserva = inicio.getHours() * 60 + inicio.getMinutes();
+    const fimReserva = fim.getHours() * 60 + fim.getMinutes();
+
+    return (
+      inicioReserva < fimDisponibilidade && fimReserva > inicioDisponibilidade
+    );
+  });
+}
+
+function tratarErro(res, erro) {
+  console.error("Erro nas disponibilidades:", erro);
+
+  if (erro.code === 11000) {
+    return res.status(409).json({
+      message: "Já existe uma disponibilidade com esse ID.",
+    });
+  }
+
+  return res.status(500).json({
+    message: "Erro interno ao processar a disponibilidade.",
+  });
+}
+
 // ============================================
-// DOCUMENTAÇÃO SWAGGER - SCHEMAS
+// DOCUMENTAÇÃO SWAGGER
 // ============================================
 
 /**
@@ -135,26 +173,31 @@ function findConflict(
  *         id:
  *           type: string
  *           format: uuid
- *           description: Identificador único da disponibilidade
  *         space_id:
  *           type: string
- *           description: Identificador da sala
  *         day_of_week:
  *           type: integer
  *           minimum: 0
  *           maximum: 6
- *           description: Dia da semana (0 domingo, 6 sábado)
  *         start_time:
  *           type: string
- *           description: Horário de início no formato HH:MM
  *           example: "08:00"
  *         end_time:
  *           type: string
- *           description: Horário de término no formato HH:MM
  *           example: "12:00"
  *         is_external_allowed:
  *           type: boolean
- *           description: Indica se usuários externos são permitidos
+ *         is_active:
+ *           type: boolean
+ *           example: true
+ *       example:
+ *         id: "f75e23c0-6f4f-469c-aac3-cf40574d8758"
+ *         space_id: "a1b2c3d4-1111-4222-8333-444455556666"
+ *         day_of_week: 1
+ *         start_time: "08:00"
+ *         end_time: "12:00"
+ *         is_external_allowed: true
+ *         is_active: true
  *
  *     DisponibilidadeInput:
  *       type: object
@@ -166,24 +209,18 @@ function findConflict(
  *       properties:
  *         space_id:
  *           type: string
- *           description: ID de uma sala cadastrada
- *           example: "a1b2c3d4-1111-4222-8333-444455556666"
  *         day_of_week:
  *           type: integer
  *           minimum: 0
  *           maximum: 6
- *           description: Dia da semana
- *           example: 1
  *         start_time:
  *           type: string
  *           example: "08:00"
  *         end_time:
  *           type: string
- *           example: "12:00"
+ *           example: "18:00"
  *         is_external_allowed:
  *           type: boolean
- *           default: true
- *           example: true
  *
  *     DisponibilidadeUpdate:
  *       type: object
@@ -192,16 +229,17 @@ function findConflict(
  *           type: integer
  *           minimum: 0
  *           maximum: 6
- *           example: 2
  *         start_time:
  *           type: string
- *           example: "09:00"
+ *           example: "08:00"
  *         end_time:
  *           type: string
- *           example: "13:00"
+ *           example: "18:00"
  *         is_external_allowed:
  *           type: boolean
- *           example: false
+ *         is_active:
+ *           type: boolean
+ *           description: Envie true para reativar uma disponibilidade inativa.
  */
 
 // ============================================
@@ -212,61 +250,90 @@ function findConflict(
  * @swagger
  * /disponibilidades:
  *   get:
- *     summary: Listar todas as disponibilidades
- *     description: Retorna disponibilidades, permitindo filtros por sala, dia e permissão externa.
+ *     summary: Listar disponibilidades
  *     tags: [Disponibilidades]
  *     parameters:
  *       - in: query
  *         name: space_id
  *         schema:
  *           type: string
- *         description: Filtrar pelo ID da sala
  *       - in: query
  *         name: day_of_week
  *         schema:
  *           type: integer
- *           minimum: 0
- *           maximum: 6
- *         description: Filtrar pelo dia da semana
  *       - in: query
  *         name: is_external_allowed
  *         schema:
  *           type: boolean
- *         description: Filtrar pela permissão de usuários externos
+ *       - in: query
+ *         name: include_inactive
+ *         description: Permite que ADMIN e RECEPTION consultem também disponibilidades inativas.
+ *         schema:
+ *           type: boolean
  *     responses:
  *       200:
  *         description: Lista de disponibilidades retornada com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/Disponibilidade'
  */
 
-router.get("/", (req, res) => {
-  let disponibilidades = readData();
+router.get(
+  "/",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION", "CLIENT"),
+  async (req, res) => {
+    try {
+      const { space_id, day_of_week, is_external_allowed, include_inactive } =
+        req.query;
 
-  const { space_id, day_of_week, is_external_allowed } = req.query;
+      const filtro = {};
 
-  if (space_id) {
-    disponibilidades = disponibilidades.filter((d) => d.space_id === space_id);
-  }
+      if (space_id) {
+        filtro.space_id = space_id;
+      }
 
-  if (day_of_week !== undefined) {
-    disponibilidades = disponibilidades.filter(
-      (d) => String(d.day_of_week) === String(day_of_week),
-    );
-  }
+      if (day_of_week !== undefined) {
+        const dia = parseDia(day_of_week);
 
-  if (is_external_allowed !== undefined) {
-    disponibilidades = disponibilidades.filter(
-      (d) => String(d.is_external_allowed) === is_external_allowed,
-    );
-  }
+        if (dia === null) {
+          return res.status(400).json({
+            message: "day_of_week deve ser um número inteiro de 0 a 6.",
+          });
+        }
 
-  res.json(disponibilidades);
-});
+        filtro.day_of_week = dia;
+      }
+
+      if (is_external_allowed !== undefined) {
+        if (is_external_allowed !== "true" && is_external_allowed !== "false") {
+          return res.status(400).json({
+            message: "is_external_allowed deve ser true ou false.",
+          });
+        }
+
+        filtro.is_external_allowed = is_external_allowed === "true";
+      }
+
+      if (include_inactive !== undefined) {
+        if (include_inactive !== "true" && include_inactive !== "false") {
+          return res.status(400).json({
+            message: "include_inactive deve ser true ou false.",
+          });
+        }
+      }
+
+      // CLIENT nunca pode consultar disponibilidades inativas.
+      // ADMIN e RECEPTION podem usar include_inactive=true.
+      if (req.usuario.role === "CLIENT" || include_inactive !== "true") {
+        filtro.is_active = { $ne: false };
+      }
+
+      const disponibilidades = await Disponibilidade.find(filtro);
+
+      return res.json(disponibilidades);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 // ============================================
 // GET - BUSCAR POR ID
@@ -284,29 +351,41 @@ router.get("/", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da disponibilidade
  *     responses:
  *       200:
  *         description: Disponibilidade encontrada
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Disponibilidade'
  *       404:
  *         description: Disponibilidade não encontrada
  */
 
-router.get("/:id", (req, res) => {
-  const disponibilidade = readData().find((d) => d.id === req.params.id);
+router.get(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION", "CLIENT"),
+  async (req, res) => {
+    try {
+      const filtro = {
+        id: req.params.id,
+      };
 
-  if (!disponibilidade) {
-    return res.status(404).json({
-      message: "Disponibilidade não encontrada",
-    });
-  }
+      if (req.usuario.role === "CLIENT") {
+        filtro.is_active = { $ne: false };
+      }
 
-  res.json(disponibilidade);
-});
+      const disponibilidade = await Disponibilidade.findOne(filtro);
+
+      if (!disponibilidade) {
+        return res.status(404).json({
+          message: "Disponibilidade não encontrada",
+        });
+      }
+
+      return res.json(disponibilidade);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 // ============================================
 // POST - CADASTRAR DISPONIBILIDADE
@@ -317,7 +396,7 @@ router.get("/:id", (req, res) => {
  * /disponibilidades:
  *   post:
  *     summary: Cadastrar nova disponibilidade
- *     description: Cadastra uma janela de disponibilidade para uma sala.
+ *     description: Cadastra uma janela de horário para uma sala existente e ativa.
  *     tags: [Disponibilidades]
  *     requestBody:
  *       required: true
@@ -328,92 +407,102 @@ router.get("/:id", (req, res) => {
  *     responses:
  *       201:
  *         description: Disponibilidade cadastrada com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Disponibilidade'
  *       400:
- *         description: Dados inválidos ou obrigatórios ausentes
+ *         description: Dados inválidos
  *       404:
  *         description: Sala não encontrada
  *       409:
- *         description: Conflito com horário já cadastrado
+ *         description: Conflito de horários
  */
 
-router.post("/", (req, res) => {
-  const { space_id, day_of_week, start_time, end_time } = req.body;
+router.post(
+  "/",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION"),
+  async (req, res) => {
+    try {
+      const { space_id, day_of_week, start_time, end_time } = req.body;
 
-  const is_external_allowed =
-    req.body.is_external_allowed === undefined
-      ? true
-      : req.body.is_external_allowed;
+      const is_external_allowed =
+        req.body.is_external_allowed === undefined
+          ? true
+          : req.body.is_external_allowed;
 
-  if (!space_id || day_of_week === undefined || !start_time || !end_time) {
-    return res.status(400).json({
-      message:
-        "Os campos space_id, day_of_week, start_time e end_time são obrigatórios.",
-    });
-  }
+      if (!space_id || day_of_week === undefined || !start_time || !end_time) {
+        return res.status(400).json({
+          message:
+            "Os campos space_id, day_of_week, start_time e end_time são obrigatórios.",
+        });
+      }
 
-  const validacao = validarJanela({
-    day_of_week,
-    start_time,
-    end_time,
-    is_external_allowed,
-  });
+      const validacao = validarJanela({
+        day_of_week,
+        start_time,
+        end_time,
+        is_external_allowed,
+      });
 
-  if (validacao.erro) {
-    return res.status(400).json({
-      message: validacao.erro,
-    });
-  }
+      if (validacao.erro) {
+        return res.status(400).json({
+          message: validacao.erro,
+        });
+      }
 
-  if (!findSalaById(space_id)) {
-    return res.status(404).json({
-      message: "Sala não encontrada",
-    });
-  }
+      const sala = await Sala.findOne({ id: space_id });
 
-  const disponibilidades = readData();
+      if (!sala) {
+        return res.status(404).json({
+          message: "Sala não encontrada",
+        });
+      }
 
-  if (
-    findConflict(
-      disponibilidades,
-      space_id,
-      validacao.dados.day_of_week,
-      start_time,
-      end_time,
-    )
-  ) {
-    return res.status(409).json({
-      message:
-        "Já existe uma janela cadastrada que se sobrepõe a este horário para esta sala e dia.",
-    });
-  }
+      if (!sala.is_active) {
+        return res.status(400).json({
+          message:
+            "Não é possível cadastrar disponibilidade para uma sala inativa.",
+        });
+      }
 
-  const novaDisponibilidade = {
-    id: uuidv4(),
-    space_id,
-    ...validacao.dados,
-  };
+      const conflito = await findConflict(
+        space_id,
+        validacao.dados.day_of_week,
+        start_time,
+        end_time,
+      );
 
-  disponibilidades.push(novaDisponibilidade);
+      if (conflito) {
+        return res.status(409).json({
+          message:
+            "Já existe uma janela cadastrada que se sobrepõe a este horário para esta sala e dia.",
+        });
+      }
 
-  saveData(disponibilidades);
+      const novaDisponibilidade = new Disponibilidade({
+        id: randomUUID(),
+        space_id,
+        ...validacao.dados,
+        is_active: true,
+      });
 
-  res.status(201).json(novaDisponibilidade);
-});
+      await novaDisponibilidade.save();
+
+      return res.status(201).json(novaDisponibilidade);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 // ============================================
-// PUT - ATUALIZAR DISPONIBILIDADE
+// PUT - ATUALIZAR OU REATIVAR DISPONIBILIDADE
 // ============================================
 
 /**
  * @swagger
  * /disponibilidades/{id}:
  *   put:
- *     summary: Atualizar disponibilidade
- *     description: Atualiza os horários, dia ou permissão externa de uma disponibilidade.
+ *     summary: Atualizar ou reativar disponibilidade
+ *     description: Atualiza os horários ou reativa uma disponibilidade inativa enviando is_active=true.
  *     tags: [Disponibilidades]
  *     parameters:
  *       - in: path
@@ -421,7 +510,6 @@ router.post("/", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da disponibilidade
  *     requestBody:
  *       required: true
  *       content:
@@ -430,91 +518,145 @@ router.post("/", (req, res) => {
  *             $ref: '#/components/schemas/DisponibilidadeUpdate'
  *     responses:
  *       200:
- *         description: Disponibilidade atualizada com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Disponibilidade'
+ *         description: Disponibilidade atualizada ou reativada com sucesso
  *       400:
- *         description: Dados inválidos
+ *         description: Dados inválidos ou sala inativa
  *       404:
  *         description: Disponibilidade não encontrada
  *       409:
  *         description: Conflito de horários
  */
 
-router.put("/:id", (req, res) => {
-  const disponibilidades = readData();
+router.put(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION"),
+  async (req, res) => {
+    try {
+      const atual = await Disponibilidade.findOne({
+        id: req.params.id,
+      });
 
-  const index = disponibilidades.findIndex((d) => d.id === req.params.id);
+      if (!atual) {
+        return res.status(404).json({
+          message: "Disponibilidade não encontrada",
+        });
+      }
 
-  if (index === -1) {
-    return res.status(404).json({
-      message: "Disponibilidade não encontrada",
-    });
-  }
+      // A reativação só é aceita com o valor booleano true.
+      // Para desativar, utilize a rota DELETE.
+      if (
+        req.body.is_active !== undefined &&
+        req.body.is_active !== true &&
+        req.body.is_active !== false
+      ) {
+        return res.status(400).json({
+          message: "is_active deve ser true ou false.",
+        });
+      }
 
-  const atual = disponibilidades[index];
+      if (req.body.is_active === false) {
+        return res.status(400).json({
+          message: "Para desativar uma disponibilidade, utilize DELETE.",
+        });
+      }
 
-  const { day_of_week, start_time, end_time, is_external_allowed } = req.body;
+      const { day_of_week, start_time, end_time, is_external_allowed } =
+        req.body;
 
-  const validacao = validarJanela({
-    day_of_week: day_of_week !== undefined ? day_of_week : atual.day_of_week,
+      const validacao = validarJanela({
+        day_of_week:
+          day_of_week !== undefined ? day_of_week : atual.day_of_week,
 
-    start_time: start_time !== undefined ? start_time : atual.start_time,
+        start_time: start_time !== undefined ? start_time : atual.start_time,
 
-    end_time: end_time !== undefined ? end_time : atual.end_time,
+        end_time: end_time !== undefined ? end_time : atual.end_time,
 
-    is_external_allowed:
-      is_external_allowed !== undefined
-        ? is_external_allowed
-        : atual.is_external_allowed,
-  });
+        is_external_allowed:
+          is_external_allowed !== undefined
+            ? is_external_allowed
+            : atual.is_external_allowed,
+      });
 
-  if (validacao.erro) {
-    return res.status(400).json({
-      message: validacao.erro,
-    });
-  }
+      if (validacao.erro) {
+        return res.status(400).json({
+          message: validacao.erro,
+        });
+      }
 
-  const { dados } = validacao;
+      const { dados } = validacao;
+      const desejaReativar = req.body.is_active === true;
 
-  if (
-    findConflict(
-      disponibilidades,
-      atual.space_id,
-      dados.day_of_week,
-      dados.start_time,
-      dados.end_time,
-      atual.id,
-    )
-  ) {
-    return res.status(409).json({
-      message:
-        "Já existe uma janela cadastrada que se sobrepõe a este horário para esta sala e dia.",
-    });
-  }
+      // Se estiver reativando, a sala também precisa estar ativa.
+      if (desejaReativar) {
+        const sala = await Sala.findOne({
+          id: atual.space_id,
+        });
 
-  disponibilidades[index] = {
-    id: atual.id,
-    space_id: atual.space_id,
-    ...dados,
-  };
+        if (!sala) {
+          return res.status(404).json({
+            message:
+              "A sala vinculada a esta disponibilidade não foi encontrada.",
+          });
+        }
 
-  saveData(disponibilidades);
+        if (!sala.is_active) {
+          return res.status(400).json({
+            message:
+              "Não é possível reativar a disponibilidade porque a sala está inativa. Reative a sala primeiro.",
+          });
+        }
+      }
 
-  res.json(disponibilidades[index]);
-});
+      // Verifica conflitos com outras disponibilidades ativas.
+      const conflito = await findConflict(
+        atual.space_id,
+        dados.day_of_week,
+        dados.start_time,
+        dados.end_time,
+        atual.id,
+      );
+
+      if (conflito) {
+        return res.status(409).json({
+          message:
+            "Já existe uma janela cadastrada que se sobrepõe a este horário para esta sala e dia.",
+        });
+      }
+
+      atual.day_of_week = dados.day_of_week;
+      atual.start_time = dados.start_time;
+      atual.end_time = dados.end_time;
+      atual.is_external_allowed = dados.is_external_allowed;
+
+      if (desejaReativar) {
+        atual.is_active = true;
+      }
+
+      await atual.save();
+
+      return res.json({
+        message: desejaReativar
+          ? "Disponibilidade reativada com sucesso."
+          : "Disponibilidade atualizada com sucesso.",
+        disponibilidade: atual,
+      });
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 // ============================================
-// DELETE - EXCLUIR DISPONIBILIDADE
+// DELETE - EXCLUIR OU DESATIVAR DISPONIBILIDADE
 // ============================================
 
 /**
  * @swagger
  * /disponibilidades/{id}:
  *   delete:
- *     summary: Excluir disponibilidade
+ *     summary: Excluir ou desativar disponibilidade
+ *     description: Exclui permanentemente quando não existem reservas vinculadas. Caso existam, desativa e preserva o registro.
  *     tags: [Disponibilidades]
  *     parameters:
  *       - in: path
@@ -522,33 +664,66 @@ router.put("/:id", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da disponibilidade
  *     responses:
  *       200:
- *         description: Disponibilidade removida com sucesso
+ *         description: Disponibilidade excluída ou desativada
  *       404:
  *         description: Disponibilidade não encontrada
  */
 
-router.delete("/:id", (req, res) => {
-  const disponibilidades = readData();
+router.delete(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION"),
+  async (req, res) => {
+    try {
+      const disponibilidade = await Disponibilidade.findOne({
+        id: req.params.id,
+      });
 
-  const index = disponibilidades.findIndex((d) => d.id === req.params.id);
+      if (!disponibilidade) {
+        return res.status(404).json({
+          message: "Disponibilidade não encontrada",
+        });
+      }
 
-  if (index === -1) {
-    return res.status(404).json({
-      message: "Disponibilidade não encontrada",
-    });
-  }
+      const possuiReserva = await possuiReservaVinculada(disponibilidade);
 
-  const removida = disponibilidades.splice(index, 1);
+      if (possuiReserva) {
+        if (disponibilidade.is_active === false) {
+          return res.json({
+            message:
+              "A disponibilidade já está inativa e possui reservas vinculadas.",
+            acao: "JA_INATIVA",
+            disponibilidade,
+          });
+        }
 
-  saveData(disponibilidades);
+        disponibilidade.is_active = false;
 
-  res.json({
-    message: "Disponibilidade removida com sucesso",
-    disponibilidade: removida[0],
-  });
-});
+        await disponibilidade.save();
+
+        return res.json({
+          message:
+            "A disponibilidade possui reservas vinculadas e foi desativada. O histórico foi preservado.",
+          acao: "DESATIVADA",
+          disponibilidade,
+        });
+      }
+
+      await Disponibilidade.deleteOne({
+        id: disponibilidade.id,
+      });
+
+      return res.json({
+        message: "Disponibilidade excluída permanentemente.",
+        acao: "EXCLUIDA",
+        disponibilidade,
+      });
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 module.exports = router;

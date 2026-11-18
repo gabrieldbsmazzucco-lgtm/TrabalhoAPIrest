@@ -1,116 +1,161 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const { v4: uuidv4 } = require("uuid");
+const { randomUUID } = require("crypto");
+
+const Reserva = require("../models/Reserva");
+const Usuario = require("../models/Usuario");
+const Sala = require("../models/Sala");
+const Disponibilidade = require("../models/Disponibilidade");
+
+const authMiddleware = require("../middlewares/authMiddleware");
+const permissaoMiddleware = require("../middlewares/permissaoMiddleware");
 
 const router = express.Router();
 
-// Arquivos JSON utilizados
-const dbPath = path.join(__dirname, "../db/reservasDB.json");
-const usuariosPath = path.join(__dirname, "../db/usuariosDB.json");
-const salasPath = path.join(__dirname, "../db/salasDB.json");
-const disponibilidadePath = path.join(__dirname, "../db/disponibilidadeDB.json");
+const STATUS = ["PENDING", "APPROVED", "REJECTED", "CANCELLED"];
 
-const STATUS = {
-  PENDING: "PENDING",
-  APPROVED: "APPROVED",
-  REJECTED: "REJECTED",
-  CANCELLED: "CANCELLED",
-};
-
-// Funções auxiliares de leitura/escrita
-
-// Lê qualquer arquivo JSON; se estiver vazio ou inválido, devolve []
-function readFile(filePath) {
-  try {
-    const data = fs.readFileSync(filePath, "utf-8");
-    if (!data.trim()) return [];
-    return JSON.parse(data);
-  } catch (error) {
-    return [];
-  }
-}
-
-function readData() {
-  return readFile(dbPath);
-}
-
-function saveData(data) {
-  fs.writeFileSync(dbPath, JSON.stringify(data, null, 2), "utf-8");
-}
-
-// Acesso aos dados dos outros módulos (só leitura).
-
-function findUserById(id) {
-  return readFile(usuariosPath).find((u) => u.id === id);
-}
-
-function findSalaById(id) {
-  return readFile(salasPath).find((s) => s.id === id);
-}
-
-function findDisponibilidadesBySala(salaId) {
-  return readFile(disponibilidadePath).filter((d) => d.space_id === salaId);
-}
-
-// Usuário "externo" = cliente (role CLIENT).
-function isExternal(user) {
-  return user.role === "CLIENT";
-}
-
-// Funções auxiliares de regra de negócio
-
-// "HH:MM" (ou "HH:MM:SS") -> minutos desde 00:00
 function timeToMinutes(time) {
-  const [h, m] = String(time).split(":");
-  return Number(h) * 60 + Number(m || 0);
+  const [hours, minutes] = time.split(":").map(Number);
+  return hours * 60 + minutes;
 }
 
-function sameDay(a, b) {
+function sameDay(start, end) {
   return (
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate()
+    start.getFullYear() === end.getFullYear() &&
+    start.getMonth() === end.getMonth() &&
+    start.getDate() === end.getDate()
   );
 }
 
-// Confere se o horário cabe em alguma regra de disponibilidade da sala.
-// Se a sala não tiver nenhuma regra cadastrada, não bloqueia.
-function dentroDaDisponibilidade(user, spaceId, start, end) {
-  const regras = findDisponibilidadesBySala(spaceId);
+function validarDatas(start_datetime, end_datetime, exigirFuturo = true) {
+  const inicio = new Date(start_datetime);
+  const fim = new Date(end_datetime);
 
-  if (regras.length === 0) return true;
+  if (
+    !start_datetime ||
+    !end_datetime ||
+    Number.isNaN(inicio.getTime()) ||
+    Number.isNaN(fim.getTime())
+  ) {
+    return { erro: "Datas inválidas." };
+  }
 
-  const diaSemana = start.getDay(); // 0 (domingo) a 6 (sábado)
-  const inicioMin = start.getHours() * 60 + start.getMinutes();
-  const fimMin = end.getHours() * 60 + end.getMinutes();
+  if (fim <= inicio) {
+    return { erro: "A data final deve ser posterior à data inicial." };
+  }
 
-  return regras.some(
-    (r) =>
-      Number(r.day_of_week) === diaSemana &&
-      inicioMin >= timeToMinutes(r.start_time) &&
-      fimMin <= timeToMinutes(r.end_time) &&
-      (!isExternal(user) || r.is_external_allowed === true),
+  if (exigirFuturo && inicio <= new Date()) {
+    return { erro: "A reserva deve começar em uma data futura." };
+  }
+
+  if (!sameDay(inicio, fim)) {
+    return { erro: "A reserva deve começar e terminar no mesmo dia." };
+  }
+
+  return { inicio, fim };
+}
+
+function isExternal(usuario) {
+  return !usuario.company_id;
+}
+
+// Considera somente disponibilidades ativas.
+// Documentos antigos sem is_active são considerados ativos.
+async function dentroDaDisponibilidade(space_id, inicio, fim, usuario) {
+  const disponibilidades = await Disponibilidade.find({
+    space_id,
+    day_of_week: inicio.getDay(),
+    is_active: { $ne: false },
+  });
+
+  const inicioMinutos = inicio.getHours() * 60 + inicio.getMinutes();
+  const fimMinutos = fim.getHours() * 60 + fim.getMinutes();
+
+  return disponibilidades.some((disponibilidade) => {
+    const inicioDisponibilidade = timeToMinutes(disponibilidade.start_time);
+    const fimDisponibilidade = timeToMinutes(disponibilidade.end_time);
+
+    const horarioPermitido =
+      inicioMinutos >= inicioDisponibilidade &&
+      fimMinutos <= fimDisponibilidade;
+
+    const acessoPermitido =
+      !isExternal(usuario) || disponibilidade.is_external_allowed;
+
+    return horarioPermitido && acessoPermitido;
+  });
+}
+
+// Compara diretamente as strings armazenadas no MongoDB.
+// Não usar toISOString() aqui, pois isso pode alterar o horário
+// devido à conversão para UTC.
+async function encontrarConflito(
+  space_id,
+  start_datetime,
+  end_datetime,
+  ignorarId = null,
+) {
+  const filtro = {
+    space_id,
+    status: "APPROVED",
+    start_datetime: { $lt: end_datetime },
+    end_datetime: { $gt: start_datetime },
+  };
+
+  if (ignorarId) {
+    filtro.id = { $ne: ignorarId };
+  }
+
+  return Reserva.findOne(filtro);
+}
+
+// Rejeita automaticamente as reservas pendentes da mesma sala
+// que tenham sobreposição com a reserva aprovada.
+async function rejeitarPendentesConflitantes(
+  space_id,
+  start_datetime,
+  end_datetime,
+  ignorarId,
+) {
+  const resultado = await Reserva.updateMany(
+    {
+      space_id,
+      id: { $ne: ignorarId },
+      status: "PENDING",
+      start_datetime: { $lt: end_datetime },
+      end_datetime: { $gt: start_datetime },
+    },
+    {
+      $set: {
+        status: "REJECTED",
+        rejection_reason:
+          "Horário indisponível devido à aprovação de outra reserva.",
+      },
+    },
   );
+
+  return resultado.modifiedCount ?? resultado.nModified ?? 0;
 }
 
-// Duas reservas se sobrepõem se: inicioA < fimB E fimA > inicioB.
-// Reservas coladas (uma termina quando a outra começa) NÃO são conflito.
-function overlaps(startA, endA, startB, endB) {
-  return startA < endB && endA > startB;
+function tratarErro(res, erro) {
+  console.error("Erro nas reservas:", erro);
+
+  if (erro.code === 11000) {
+    return res.status(409).json({
+      mensagem: "Já existe uma reserva com esses dados.",
+    });
+  }
+
+  return res.status(500).json({
+    mensagem: "Erro interno ao processar a reserva.",
+  });
 }
 
-// Procura uma reserva APPROVED no mesmo espaço que se sobreponha ao intervalo.
-// ignoreId evita que a reserva conflite com ela mesma ao ser aprovada.
-function findConflict(reservas, spaceId, start, end, ignoreId) {
-  return reservas.find(
-    (r) =>
-      r.id !== ignoreId &&
-      r.space_id === spaceId &&
-      r.status === STATUS.APPROVED &&
-      overlaps(start, end, new Date(r.start_datetime), new Date(r.end_datetime)),
-  );
-}
+/**
+ * @swagger
+ * tags:
+ *   - name: Reservas
+ *     description: Gerenciamento de reservas
+ */
 
 /**
  * @swagger
@@ -121,96 +166,95 @@ function findConflict(reservas, spaceId, start, end, ignoreId) {
  *       properties:
  *         id:
  *           type: string
- *           description: ID gerado automaticamente (UUID)
+ *           example: "3afe4457-8d9f-4e70-a27f-5a27952b1ea7"
  *         space_id:
  *           type: string
- *           description: ID da sala/espaço reservado
+ *           example: "a1b2c3d4-1111-4222-8333-444455556666"
  *         user_id:
  *           type: string
- *           description: ID do usuário que solicitou
+ *           example: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+ *         number_of_people:
+ *           type: integer
+ *           minimum: 1
+ *           example: 5
  *         start_datetime:
  *           type: string
- *           format: date-time
+ *           example: "2026-11-16T09:00:00"
  *         end_datetime:
  *           type: string
- *           format: date-time
+ *           example: "2026-11-16T11:00:00"
  *         status:
  *           type: string
  *           enum: [PENDING, APPROVED, REJECTED, CANCELLED]
+ *           example: "PENDING"
  *         rejection_reason:
  *           type: string
  *           nullable: true
+ *           example: null
  *         created_at:
  *           type: string
- *           format: date-time
- *       example:
- *         id: "9f1c2b7e-5d3a-4e8f-a1b2-0c3d4e5f6a7b"
- *         space_id: "a1b2c3d4-1111-4222-8333-444455556666"
- *         user_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
- *         start_datetime: "2026-10-12T14:00:00"
- *         end_datetime: "2026-10-12T16:00:00"
- *         status: "PENDING"
- *         rejection_reason: null
- *         created_at: "2026-10-06T12:00:00.000Z"
+ *           example: "2026-11-13T10:00:00.000Z"
  *
  *     ReservaInput:
  *       type: object
  *       required:
  *         - space_id
- *         - user_id
  *         - start_datetime
  *         - end_datetime
+ *         - number_of_people
  *       properties:
  *         space_id:
  *           type: string
+ *           example: "a1b2c3d4-1111-4222-8333-444455556666"
  *         user_id:
  *           type: string
+ *           example: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+ *         number_of_people:
+ *           type: integer
+ *           minimum: 1
+ *           example: 5
  *         start_datetime:
  *           type: string
- *           format: date-time
+ *           example: "2026-11-16T14:00:00"
  *         end_datetime:
  *           type: string
- *           format: date-time
+ *           example: "2026-11-16T16:00:00"
  *       example:
  *         space_id: "a1b2c3d4-1111-4222-8333-444455556666"
  *         user_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
- *         start_datetime: "2026-10-12T14:00:00"
- *         end_datetime: "2026-10-12T16:00:00"
+ *         number_of_people: 5
+ *         start_datetime: "2026-11-16T14:00:00"
+ *         end_datetime: "2026-11-16T16:00:00"
  *
  *     ReservaUpdateInput:
  *       type: object
- *       description: Todos os campos são opcionais; o que não for enviado continua como estava.
  *       properties:
- *         space_id:
- *           type: string
  *         start_datetime:
  *           type: string
- *           format: date-time
+ *           example: "2026-11-16T14:00:00"
  *         end_datetime:
  *           type: string
- *           format: date-time
+ *           example: "2026-11-16T16:00:00"
  *         status:
  *           type: string
  *           enum: [PENDING, APPROVED, REJECTED, CANCELLED]
+ *           example: "APPROVED"
  *         rejection_reason:
  *           type: string
- *           description: Obrigatório quando o status for REJECTED
+ *           nullable: true
+ *           example: null
  *       example:
+ *         start_datetime: "2026-11-16T14:00:00"
+ *         end_datetime: "2026-11-16T16:00:00"
  *         status: "APPROVED"
- */
-
-/**
- * @swagger
- * tags:
- *   name: Reservas
- *   description: API de registro de solicitações e reservas (bookings)
+ *         rejection_reason: null
  */
 
 /**
  * @swagger
  * /reservas:
  *   get:
- *     summary: Retorna a lista de reservas
+ *     summary: Lista todas as reservas
  *     tags: [Reservas]
  *     parameters:
  *       - in: query
@@ -218,45 +262,59 @@ function findConflict(reservas, spaceId, start, end, ignoreId) {
  *         schema:
  *           type: string
  *           enum: [PENDING, APPROVED, REJECTED, CANCELLED]
- *         description: Filtrar por status
  *       - in: query
  *         name: space_id
  *         schema:
  *           type: string
- *         description: Filtrar por sala
  *       - in: query
  *         name: user_id
  *         schema:
  *           type: string
- *         description: Filtrar por usuário
  *     responses:
  *       200:
- *         description: Lista de reservas obtida com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/Reserva'
+ *         description: Lista de reservas
  */
-router.get("/", (req, res) => {
-  let reservas = readData();
-  const { status, space_id, user_id } = req.query;
+router.get(
+  "/",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION", "CLIENT"),
+  async (req, res) => {
+    try {
+      const filtro = {};
 
-  if (status) {
-    reservas = reservas.filter((r) => r.status === status.toUpperCase());
-  }
+      if (req.query.status) {
+        const status = String(req.query.status).toUpperCase();
 
-  if (space_id) {
-    reservas = reservas.filter((r) => r.space_id === space_id);
-  }
+        if (!STATUS.includes(status)) {
+          return res.status(400).json({
+            mensagem: "Status inválido.",
+          });
+        }
 
-  if (user_id) {
-    reservas = reservas.filter((r) => r.user_id === user_id);
-  }
+        filtro.status = status;
+      }
 
-  res.json(reservas);
-});
+      if (req.query.space_id) {
+        filtro.space_id = req.query.space_id;
+      }
+
+      // CLIENT só consulta as próprias reservas.
+      if (req.usuario.role === "CLIENT") {
+        filtro.user_id = req.usuario.id;
+      } else if (req.query.user_id) {
+        filtro.user_id = req.query.user_id;
+      }
+
+      const reservas = await Reserva.find(filtro).sort({
+        created_at: -1,
+      });
+
+      return res.status(200).json(reservas);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 /**
  * @swagger
@@ -270,32 +328,48 @@ router.get("/", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da reserva
  *     responses:
  *       200:
  *         description: Reserva encontrada
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Reserva'
  *       404:
  *         description: Reserva não encontrada
  */
-router.get("/:id", (req, res) => {
-  const reserva = readData().find((r) => r.id === req.params.id);
+router.get(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION", "CLIENT"),
+  async (req, res) => {
+    try {
+      const filtro = {
+        id: req.params.id,
+      };
 
-  if (!reserva) {
-    return res.status(404).json({ message: "Reserva não encontrada" });
-  }
+      // CLIENT não pode consultar reserva de outro usuário.
+      if (req.usuario.role === "CLIENT") {
+        filtro.user_id = req.usuario.id;
+      }
 
-  res.json(reserva);
-});
+      const reserva = await Reserva.findOne(filtro);
+
+      if (!reserva) {
+        return res.status(404).json({
+          mensagem: "Reserva não encontrada.",
+        });
+      }
+
+      return res.status(200).json(reserva);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 /**
  * @swagger
  * /reservas:
  *   post:
- *     summary: Cria uma solicitação de reserva (nasce como PENDING)
+ *     summary: Cria uma nova reserva
+ *     description: Cria uma solicitação de reserva para uma sala em um horário disponível. A reserva é criada com status PENDING.
  *     tags: [Reservas]
  *     requestBody:
  *       required: true
@@ -305,117 +379,145 @@ router.get("/:id", (req, res) => {
  *             $ref: '#/components/schemas/ReservaInput'
  *     responses:
  *       201:
- *         description: Solicitação criada com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Reserva'
+ *         description: Reserva criada com sucesso
  *       400:
- *         description: Dados inválidos, sala inativa ou fora da disponibilidade
+ *         description: Dados inválidos ou sala indisponível
  *       404:
  *         description: Usuário ou sala não encontrados
  *       409:
- *         description: Já existe uma reserva aprovada nesse horário
+ *         description: Conflito com outra reserva aprovada
  */
-router.post("/", (req, res) => {
-  const { space_id, user_id, start_datetime, end_datetime } = req.body;
+router.post(
+  "/",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION", "CLIENT"),
+  async (req, res) => {
+    try {
+      const { space_id, start_datetime, end_datetime, number_of_people } =
+        req.body;
 
-  // 1. Campos obrigatórios
-  if (!space_id || !user_id || !start_datetime || !end_datetime) {
-    return res.status(400).json({
-      message:
-        "Os campos space_id, user_id, start_datetime e end_datetime são obrigatórios.",
-    });
-  }
+      // CLIENT sempre cria uma reserva para si mesmo.
+      // ADMIN e RECEPTION podem informar o usuário.
+      const user_id =
+        req.usuario.role === "CLIENT" ? req.usuario.id : req.body.user_id;
 
-  // 2. Datas válidas
-  const start = new Date(start_datetime);
-  const end = new Date(end_datetime);
+      if (!space_id || !user_id || !start_datetime || !end_datetime) {
+        return res.status(400).json({
+          mensagem: "Informe sala, usuário, data inicial e data final.",
+        });
+      }
 
-  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-    return res.status(400).json({
-      message: "Datas inválidas. Use o formato ISO, ex: 2026-10-12T14:00:00.",
-    });
-  }
+      if (
+        number_of_people === undefined ||
+        number_of_people === null ||
+        String(number_of_people).trim() === "" ||
+        !Number.isInteger(Number(number_of_people)) ||
+        Number(number_of_people) < 1
+      ) {
+        return res.status(400).json({
+          mensagem:
+            "Informe uma quantidade válida de pessoas (número inteiro maior que zero).",
+        });
+      }
 
-  if (start >= end) {
-    return res.status(400).json({
-      message: "start_datetime deve ser anterior a end_datetime.",
-    });
-  }
+      const quantidadePessoas = Number(number_of_people);
 
-  if (start < new Date()) {
-    return res.status(400).json({
-      message: "Não é possível reservar em uma data/hora que já passou.",
-    });
-  }
+      const validacao = validarDatas(start_datetime, end_datetime);
 
-  // A reserva precisa começar e terminar no mesmo dia
-  if (!sameDay(start, end)) {
-    return res.status(400).json({
-      message: "A reserva deve começar e terminar no mesmo dia.",
-    });
-  }
+      if (validacao.erro) {
+        return res.status(400).json({
+          mensagem: validacao.erro,
+        });
+      }
 
-  // 3. Usuário e sala existem
-  const user = findUserById(user_id);
-  if (!user) {
-    return res.status(404).json({ message: "Usuário não encontrado" });
-  }
+      const usuario = await Usuario.findOne({ id: user_id });
 
-  const sala = findSalaById(space_id);
-  if (!sala) {
-    return res.status(404).json({ message: "Sala não encontrada" });
-  }
+      if (!usuario) {
+        return res.status(404).json({
+          mensagem: "Usuário não encontrado.",
+        });
+      }
 
-  // 4. Sala ativa
-  if (!sala.is_active) {
-    return res.status(400).json({ message: "Esta sala não está ativa." });
-  }
+      const sala = await Sala.findOne({ id: space_id });
 
-  // 5. Disponibilidade semanal (só valida se a sala tiver regras cadastradas)
-  if (!dentroDaDisponibilidade(user, space_id, start, end)) {
-    return res.status(400).json({
-      message:
-        "Horário fora da disponibilidade da sala (ou não permitido para usuários externos).",
-    });
-  }
+      if (!sala) {
+        return res.status(404).json({
+          mensagem: "Sala não encontrada.",
+        });
+      }
 
-  // 6. Conflito com reserva já aprovada
-  const reservas = readData();
+      if (!sala.is_active) {
+        return res.status(400).json({
+          mensagem: "Esta sala está inativa.",
+        });
+      }
 
-  if (findConflict(reservas, space_id, start, end)) {
-    return res.status(409).json({
-      message: "Já existe uma reserva aprovada para esta sala nesse horário.",
-    });
-  }
+      if (
+        !Number.isInteger(Number(sala.capacity)) ||
+        Number(sala.capacity) < 1
+      ) {
+        return res.status(400).json({
+          mensagem:
+            "A capacidade desta sala não está configurada corretamente.",
+        });
+      }
 
-  const novaReserva = {
-    id: uuidv4(),
-    space_id,
-    user_id,
-    start_datetime,
-    end_datetime,
-    status: STATUS.PENDING,
-    rejection_reason: null,
-    created_at: new Date().toISOString(),
-  };
+      if (quantidadePessoas > Number(sala.capacity)) {
+        return res.status(400).json({
+          mensagem: `A quantidade de pessoas (${quantidadePessoas}) ultrapassa a capacidade da sala (${sala.capacity}).`,
+        });
+      }
 
-  reservas.push(novaReserva);
-  saveData(reservas);
+      const disponivel = await dentroDaDisponibilidade(
+        space_id,
+        validacao.inicio,
+        validacao.fim,
+        usuario,
+      );
 
-  res.status(201).json(novaReserva);
-});
+      if (!disponivel) {
+        return res.status(400).json({
+          mensagem: "A sala não está disponível neste horário.",
+        });
+      }
+
+      const conflito = await encontrarConflito(
+        space_id,
+        start_datetime,
+        end_datetime,
+      );
+
+      if (conflito) {
+        return res.status(409).json({
+          mensagem: "Já existe uma reserva aprovada neste horário.",
+        });
+      }
+
+      const novaReserva = await Reserva.create({
+        id: randomUUID(),
+        space_id,
+        user_id,
+        number_of_people: quantidadePessoas,
+        start_datetime,
+        end_datetime,
+        status: "PENDING",
+        rejection_reason: null,
+        created_at: new Date().toISOString(),
+      });
+
+      return res.status(201).json(novaReserva);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 /**
  * @swagger
  * /reservas/{id}:
  *   put:
- *     summary: Atualiza uma reserva existente (dados e/ou status)
- *     description: >
- *       Permite alterar sala, horário e status da reserva. Para aprovar,
- *       rejeitar ou cancelar, envie o novo status. Reservas REJECTED ou
- *       CANCELLED não podem mais ser alteradas.
+ *     summary: Atualiza uma reserva
+ *     description: Permite atualizar o horário ou alterar o status da reserva. Para aprovar, a sala deve continuar disponível.
  *     tags: [Reservas]
  *     parameters:
  *       - in: path
@@ -423,7 +525,6 @@ router.post("/", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da reserva
  *     requestBody:
  *       required: true
  *       content:
@@ -433,160 +534,228 @@ router.post("/", (req, res) => {
  *     responses:
  *       200:
  *         description: Reserva atualizada com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Reserva'
  *       400:
- *         description: Dados inválidos, sala inativa, fora da disponibilidade ou rejection_reason ausente
+ *         description: Dados inválidos ou transição de status não permitida
  *       404:
- *         description: Reserva ou sala não encontrada
+ *         description: Reserva não encontrada
  *       409:
- *         description: Transição de status inválida, reserva já finalizada ou conflito de horário
+ *         description: Conflito com outra reserva aprovada
  */
-router.put("/:id", (req, res) => {
-  const reservas = readData();
-  const index = reservas.findIndex((r) => r.id === req.params.id);
+router.put(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION", "CLIENT"),
+  async (req, res) => {
+    try {
+      const filtro = {
+        id: req.params.id,
+      };
 
-  if (index === -1) {
-    return res.status(404).json({ message: "Reserva não encontrada" });
-  }
+      // CLIENT só pode encontrar a própria reserva.
+      if (req.usuario.role === "CLIENT") {
+        filtro.user_id = req.usuario.id;
+      }
 
-  const atual = reservas[index];
+      const reserva = await Reserva.findOne(filtro);
 
-  // Reservas rejeitadas ou canceladas não podem mais ser alteradas
-  if (atual.status === STATUS.REJECTED || atual.status === STATUS.CANCELLED) {
-    return res.status(409).json({
-      message: `Não é possível alterar uma reserva ${atual.status}.`,
-    });
-  }
+      if (!reserva) {
+        return res.status(404).json({
+          mensagem: "Reserva não encontrada.",
+        });
+      }
 
-  const { space_id, start_datetime, end_datetime, status, rejection_reason } =
-    req.body;
+      // Regras específicas para CLIENT.
+      if (req.usuario.role === "CLIENT") {
+        const camposPermitidos = ["status"];
+        const camposRecebidos = Object.keys(req.body);
 
-  // Status: valida o valor e a transição (PENDING -> qualquer; APPROVED -> APPROVED ou CANCELLED)
-  const novoStatus =
-    status !== undefined ? String(status).toUpperCase() : atual.status;
+        const possuiCampoNaoPermitido = camposRecebidos.some(
+          (campo) => !camposPermitidos.includes(campo),
+        );
 
-  if (!Object.values(STATUS).includes(novoStatus)) {
-    return res.status(400).json({
-      message: "Status inválido. Use PENDING, APPROVED, REJECTED ou CANCELLED.",
-    });
-  }
+        if (possuiCampoNaoPermitido) {
+          return res.status(403).json({
+            mensagem:
+              "Você só pode cancelar uma reserva própria que esteja pendente.",
+          });
+        }
 
-  if (
-    atual.status === STATUS.APPROVED &&
-    novoStatus !== STATUS.APPROVED &&
-    novoStatus !== STATUS.CANCELLED
-  ) {
-    return res.status(409).json({
-      message: "Uma reserva APPROVED só pode continuar APPROVED ou ser CANCELLED.",
-    });
-  }
+        if (
+          req.body.status === undefined ||
+          String(req.body.status).toUpperCase() !== "CANCELLED"
+        ) {
+          return res.status(400).json({
+            mensagem: "Você só pode cancelar sua própria reserva.",
+          });
+        }
 
-  // Rejeitar exige um motivo
-  const motivo =
-    rejection_reason !== undefined ? String(rejection_reason).trim() : "";
+        if (reserva.status !== "PENDING") {
+          return res.status(400).json({
+            mensagem:
+              "Somente reservas pendentes podem ser canceladas pelo cliente.",
+          });
+        }
 
-  if (novoStatus === STATUS.REJECTED && !motivo) {
-    return res.status(400).json({
-      message: "O campo rejection_reason é obrigatório ao rejeitar.",
-    });
-  }
+        reserva.status = "CANCELLED";
+        reserva.rejection_reason = null;
 
-  // Dados da reserva (o que não vier no body continua como estava)
-  const novoSpaceId = space_id || atual.space_id;
-  const novoInicio = start_datetime || atual.start_datetime;
-  const novoFim = end_datetime || atual.end_datetime;
+        await reserva.save();
 
-  const start = new Date(novoInicio);
-  const end = new Date(novoFim);
+        return res.status(200).json(reserva);
+      }
 
-  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-    return res.status(400).json({
-      message: "Datas inválidas. Use o formato ISO, ex: 2026-10-12T14:00:00.",
-    });
-  }
+      // Regras de atualização para ADMIN e RECEPTION.
+      const novoStatus = req.body.status
+        ? String(req.body.status).toUpperCase()
+        : reserva.status;
 
-  if (start >= end) {
-    return res.status(400).json({
-      message: "start_datetime deve ser anterior a end_datetime.",
-    });
-  }
+      if (!STATUS.includes(novoStatus)) {
+        return res.status(400).json({
+          mensagem: "Status inválido.",
+        });
+      }
 
-  // Só barra datas passadas se o horário foi realmente alterado
-  const horarioMudou =
-    start.getTime() !== new Date(atual.start_datetime).getTime() ||
-    end.getTime() !== new Date(atual.end_datetime).getTime();
+      if (
+        ["REJECTED", "CANCELLED"].includes(reserva.status) &&
+        novoStatus !== reserva.status
+      ) {
+        return res.status(400).json({
+          mensagem:
+            "Não é possível alterar uma reserva rejeitada ou cancelada.",
+        });
+      }
 
-  if (horarioMudou && start < new Date()) {
-    return res.status(400).json({
-      message: "Não é possível reservar em uma data/hora que já passou.",
-    });
-  }
+      if (
+        reserva.status === "APPROVED" &&
+        !["APPROVED", "CANCELLED"].includes(novoStatus)
+      ) {
+        return res.status(400).json({
+          mensagem:
+            "Uma reserva aprovada só pode permanecer aprovada ou ser cancelada.",
+        });
+      }
 
-  if (!sameDay(start, end)) {
-    return res.status(400).json({
-      message: "A reserva deve começar e terminar no mesmo dia.",
-    });
-  }
+      const rejectionReason =
+        req.body.rejection_reason !== undefined
+          ? req.body.rejection_reason
+          : reserva.rejection_reason;
 
-  const sala = findSalaById(novoSpaceId);
-  if (!sala) {
-    return res.status(404).json({ message: "Sala não encontrada" });
-  }
+      if (novoStatus === "REJECTED" && !rejectionReason) {
+        return res.status(400).json({
+          mensagem: "Informe o motivo da rejeição.",
+        });
+      }
 
-  // Reservas que continuam ativas (PENDING/APPROVED) passam por todas as regras
-  if (novoStatus === STATUS.PENDING || novoStatus === STATUS.APPROVED) {
-    if (!sala.is_active) {
-      return res.status(400).json({ message: "Esta sala não está ativa." });
-    }
+      const start_datetime = req.body.start_datetime || reserva.start_datetime;
 
-    const user = findUserById(atual.user_id);
-    if (!user) {
-      return res.status(404).json({ message: "Usuário não encontrado" });
-    }
+      const end_datetime = req.body.end_datetime || reserva.end_datetime;
 
-    if (!dentroDaDisponibilidade(user, novoSpaceId, start, end)) {
-      return res.status(400).json({
-        message:
-          "Horário fora da disponibilidade da sala (ou não permitido para usuários externos).",
+      const alterouDatas =
+        start_datetime !== reserva.start_datetime ||
+        end_datetime !== reserva.end_datetime;
+
+      const validacao = validarDatas(
+        start_datetime,
+        end_datetime,
+        alterouDatas,
+      );
+
+      if (validacao.erro) {
+        return res.status(400).json({
+          mensagem: validacao.erro,
+        });
+      }
+
+      const usuario = await Usuario.findOne({
+        id: reserva.user_id,
       });
-    }
 
-    // ignora a própria reserva na checagem de conflito
-    if (findConflict(reservas, novoSpaceId, start, end, atual.id)) {
-      return res.status(409).json({
-        message: "Já existe uma reserva aprovada para esta sala nesse horário.",
+      if (!usuario) {
+        return res.status(404).json({
+          mensagem: "Usuário da reserva não encontrado.",
+        });
+      }
+
+      const sala = await Sala.findOne({
+        id: reserva.space_id,
       });
+
+      if (!sala) {
+        return res.status(404).json({
+          mensagem: "Sala da reserva não encontrada.",
+        });
+      }
+
+      if (!sala.is_active && novoStatus !== "CANCELLED") {
+        return res.status(400).json({
+          mensagem: "Esta sala está inativa.",
+        });
+      }
+
+      if (novoStatus === "APPROVED" || alterouDatas) {
+        const disponivel = await dentroDaDisponibilidade(
+          reserva.space_id,
+          validacao.inicio,
+          validacao.fim,
+          usuario,
+        );
+
+        if (!disponivel) {
+          return res.status(400).json({
+            mensagem: "A sala não está disponível neste horário.",
+          });
+        }
+
+        const conflito = await encontrarConflito(
+          reserva.space_id,
+          start_datetime,
+          end_datetime,
+          reserva.id,
+        );
+
+        if (conflito) {
+          return res.status(409).json({
+            mensagem: "Já existe outra reserva aprovada neste horário.",
+          });
+        }
+      }
+
+      reserva.start_datetime = start_datetime;
+      reserva.end_datetime = end_datetime;
+      reserva.status = novoStatus;
+      reserva.rejection_reason =
+        novoStatus === "REJECTED" ? rejectionReason : null;
+
+      await reserva.save();
+
+      let reservasRejeitadas = 0;
+
+      // Quando uma reserva é aprovada, rejeita as outras pendentes
+      // da mesma sala que tenham sobreposição de horário.
+      if (novoStatus === "APPROVED") {
+        reservasRejeitadas = await rejeitarPendentesConflitantes(
+          reserva.space_id,
+          start_datetime,
+          end_datetime,
+          reserva.id,
+        );
+      }
+
+      return res.status(200).json({
+        ...reserva.toObject(),
+        reservas_rejeitadas: reservasRejeitadas,
+      });
+    } catch (erro) {
+      return tratarErro(res, erro);
     }
-  }
-
-  const reservaAtualizada = {
-    ...atual,
-    space_id: novoSpaceId,
-    start_datetime: novoInicio,
-    end_datetime: novoFim,
-    status: novoStatus,
-    rejection_reason: novoStatus === STATUS.REJECTED ? motivo : null,
-
-    // Não permite alterar o ID, o dono nem a data de criação
-    id: atual.id,
-    user_id: atual.user_id,
-    created_at: atual.created_at,
-  };
-
-  reservas[index] = reservaAtualizada;
-  saveData(reservas);
-
-  res.json(reservaAtualizada);
-});
+  },
+);
 
 /**
  * @swagger
  * /reservas/{id}:
  *   delete:
- *     summary: Remove uma reserva
+ *     summary: Exclui uma reserva
  *     tags: [Reservas]
  *     parameters:
  *       - in: path
@@ -594,28 +763,35 @@ router.put("/:id", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da reserva
  *     responses:
  *       200:
- *         description: Reserva removida com sucesso
+ *         description: Reserva excluída
  *       404:
  *         description: Reserva não encontrada
  */
-router.delete("/:id", (req, res) => {
-  const reservas = readData();
-  const index = reservas.findIndex((r) => r.id === req.params.id);
+router.delete(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION"),
+  async (req, res) => {
+    try {
+      const reserva = await Reserva.findOneAndDelete({
+        id: req.params.id,
+      });
 
-  if (index === -1) {
-    return res.status(404).json({ message: "Reserva não encontrada" });
-  }
+      if (!reserva) {
+        return res.status(404).json({
+          mensagem: "Reserva não encontrada.",
+        });
+      }
 
-  const reservaRemovida = reservas.splice(index, 1);
-  saveData(reservas);
-
-  res.json({
-    message: "Reserva removida com sucesso",
-    reserva: reservaRemovida[0],
-  });
-});
+      return res.status(200).json({
+        mensagem: "Reserva excluída com sucesso.",
+      });
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 module.exports = router;

@@ -1,29 +1,30 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const { v4: uuidv4 } = require("uuid");
+const bcrypt = require("bcryptjs");
+const Usuario = require("../models/Usuario");
+
+const authMiddleware = require("../middlewares/authMiddleware");
+const permissaoMiddleware = require("../middlewares/permissaoMiddleware");
 
 const router = express.Router();
 
-// Arquivo JSON utilizado para armazenar os usuários
-const dbPath = path.join(__dirname, "../db/usuariosDB.json");
-
-// Roles permitidas para os usuários
 const rolesValidas = ["ADMIN", "CLIENT", "RECEPTION"];
 
-// Função auxiliar para ler o arquivo usuariosDB.json
-function readData() {
-  try {
-    const data = fs.readFileSync(dbPath, "utf-8");
-    return JSON.parse(data);
-  } catch (error) {
-    return [];
-  }
+// Todas as rotas exigem autenticação.
+router.use(authMiddleware);
+
+// Remove campos de senha das respostas da API.
+function usuarioSemSenhas(usuario) {
+  const dados = usuario.toObject();
+
+  delete dados.password_hash;
+  delete dados.login_password_hash;
+
+  return dados;
 }
 
-// Função auxiliar para salvar no arquivo usuariosDB.json
-function saveData(data) {
-  fs.writeFileSync(dbPath, JSON.stringify(data, null, 2), "utf-8");
+// Validação das senhas.
+function senhaValida(senha) {
+  return typeof senha === "string" && senha.length >= 6;
 }
 
 /**
@@ -32,80 +33,96 @@ function saveData(data) {
  *   schemas:
  *     User:
  *       type: object
- *       required:
- *         - name
- *         - email
- *         - role
  *       properties:
  *         id:
  *           type: string
- *           description: ID gerado automaticamente (UUID)
  *         name:
  *           type: string
  *         email:
- *           type: string
- *         password_hash:
  *           type: string
  *         role:
  *           type: string
  *           enum: [ADMIN, CLIENT, RECEPTION]
  *         cpf_cnpj:
  *           type: string
+ *           nullable: true
  *         company_id:
  *           type: string
+ *           nullable: true
  *         created_at:
  *           type: string
  *           format: date-time
- *       example:
- *         id: "e8d47b19-33a1-4328-98df-8a3d1c4708a2"
- *         name: "Gabriel De Bona"
- *         email: "gabriel@email.com"
- *         password_hash: "hash123"
- *         role: "ADMIN"
- *         cpf_cnpj: "123.456.789-00"
- *         company_id: "1"
- *         created_at: "2026-09-26T03:00:00.000Z"
+ *
+ *     UserInput:
+ *       type: object
+ *       required:
+ *         - name
+ *         - email
+ *         - password
+ *         - role
+ *       properties:
+ *         name:
+ *           type: string
+ *           example: "Novo Usuário"
+ *         email:
+ *           type: string
+ *           example: "novo@email.com"
+ *         password:
+ *           type: string
+ *           format: password
+ *           example: "abc123"
+ *         role:
+ *           type: string
+ *           enum: [ADMIN, CLIENT, RECEPTION]
+ *           example: CLIENT
+ *         cpf_cnpj:
+ *           type: string
+ *           example: "123.456.789-00"
+ *         company_id:
+ *           type: string
+ *           example: "1"
  *
  *     UserUpdateInput:
  *       type: object
  *       properties:
  *         name:
  *           type: string
+ *           example: "Usuário Atualizado"
  *         email:
  *           type: string
- *         password_hash:
+ *           example: "atualizado@email.com"
+ *         password:
  *           type: string
+ *           format: password
+ *           example: "xyz789"
  *         role:
  *           type: string
  *           enum: [ADMIN, CLIENT, RECEPTION]
+ *           example: CLIENT
  *         cpf_cnpj:
  *           type: string
+ *           example: "123.456.789-00"
  *         company_id:
  *           type: string
- *       example:
- *         name: "Gabriel De Bona (Atualizado)"
- *         email: "gabriel.novo@email.com"
- *         password_hash: "novasenha123"
- *         role: "ADMIN"
- *         cpf_cnpj: "123.456.789-00"
- *         company_id: "1"
+ *           example: "1"
  */
 
 /**
  * @swagger
  * tags:
- *   name: Users
- *   description: API de Controle de Usuarios
- *     **Por Gabriel De Bona Sartor Mazzucco**
+ *   - name: Users
+ *     description: API de Controle de Usuarios
  */
-
 
 /**
  * @swagger
  * /usuarios:
  *   get:
  *     summary: Retorna a lista de usuários
+ *     description: ADMIN e RECEPTION podem consultar a lista de usuários.
  *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: query
  *         name: name
@@ -117,26 +134,44 @@ function saveData(data) {
  *         schema:
  *           type: string
  *           enum: [ADMIN, CLIENT, RECEPTION]
- *         description: Filtrar por role
+ *         description: Filtrar por perfil
  *     responses:
  *       200:
  *         description: Lista de usuários obtida com sucesso
+ *       401:
+ *         description: Token ausente ou inválido
+ *       403:
+ *         description: Acesso permitido somente para ADMIN ou RECEPTION
  */
-router.get("/", (req, res) => {
-  let users = readData();
-  const { name, role } = req.query;
+router.get("/", permissaoMiddleware("ADMIN", "RECEPTION"), async (req, res) => {
+  try {
+    const { name, role } = req.query;
 
-  if (name) {
-    users = users.filter((u) =>
-      u.name.toLowerCase().includes(name.toLowerCase()),
-    );
+    const filtro = {};
+
+    if (name) {
+      filtro.name = { $regex: name, $options: "i" };
+    }
+
+    if (role) {
+      if (!rolesValidas.includes(role.toUpperCase())) {
+        return res.status(400).json({
+          message: "Role inválida.",
+        });
+      }
+
+      filtro.role = role.toUpperCase();
+    }
+
+    const usuarios = await Usuario.find(filtro);
+
+    res.json(usuarios.map(usuarioSemSenhas));
+  } catch (error) {
+    res.status(500).json({
+      message: "Erro ao buscar usuários.",
+      error: error.message,
+    });
   }
-
-  if (role) {
-    users = users.filter((u) => u.role.toUpperCase() === role.toUpperCase());
-  }
-
-  res.json(users);
 });
 
 /**
@@ -144,7 +179,10 @@ router.get("/", (req, res) => {
  * /usuarios/{id}:
  *   get:
  *     summary: Busca um usuário pelo ID
+ *     description: ADMIN e RECEPTION podem consultar um usuário.
  *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -154,99 +192,107 @@ router.get("/", (req, res) => {
  *     responses:
  *       200:
  *         description: Usuário encontrado
+ *       401:
+ *         description: Token ausente ou inválido
+ *       403:
+ *         description: Acesso permitido somente para ADMIN ou RECEPTION
  *       404:
  *         description: Usuário não encontrado
  */
-router.get("/:id", (req, res) => {
-  const users = readData();
+router.get(
+  "/:id",
+  permissaoMiddleware("ADMIN", "RECEPTION"),
+  async (req, res) => {
+    try {
+      const usuario = await Usuario.findOne({
+        id: req.params.id,
+      });
 
-  const user = users.find((u) => u.id === req.params.id);
+      if (!usuario) {
+        return res.status(404).json({
+          message: "Usuário não encontrado.",
+        });
+      }
 
-  if (!user) {
-    return res.status(404).json({
-      message: "Usuário não encontrado",
-    });
-  }
-
-  res.json(user);
-});
+      res.json(usuarioSemSenhas(usuario));
+    } catch (error) {
+      res.status(500).json({
+        message: "Erro ao buscar usuário.",
+        error: error.message,
+      });
+    }
+  },
+);
 
 /**
  * @swagger
  * /usuarios:
  *   post:
- *     summary: Cria um novo usuário
+ *     summary: Cadastra um novo usuário
  *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
  *         application/json:
  *           schema:
- *             type: object
- *             required:
- *               - name
- *               - email
- *               - role
- *             properties:
- *               name:
- *                 type: string
- *               email:
- *                 type: string
- *               password_hash:
- *                 type: string
- *               role:
- *                 type: string
- *                 enum: [ADMIN, CLIENT, RECEPTION]
- *               cpf_cnpj:
- *                 type: string
- *               company_id:
- *                 type: string
- *             example:
- *               name: "Gabriel De Bona"
- *               email: "gabriel@email.com"
- *               password_hash: "hash123"
- *               role: "ADMIN"
- *               cpf_cnpj: "123.456.789-00"
- *               company_id: "1"
+ *             $ref: '#/components/schemas/UserInput'
  *     responses:
  *       201:
  *         description: Usuário criado com sucesso
  *       400:
- *         description: Dados inválidos ou campos obrigatórios ausentes
+ *         description: Dados inválidos
+ *       401:
+ *         description: Token ausente ou inválido
+ *       403:
+ *         description: Acesso permitido somente para ADMIN
  */
-router.post("/", (req, res) => {
-  const users = readData();
+router.post("/", permissaoMiddleware("ADMIN"), async (req, res) => {
+  try {
+    const { name, email, password, role, cpf_cnpj, company_id } = req.body;
 
-  const { name, email, password_hash, role, cpf_cnpj, company_id } = req.body;
+    if (!name || !email || !password || !role) {
+      return res.status(400).json({
+        message: "Nome, e-mail, senha e perfil são obrigatórios.",
+      });
+    }
 
-  if (!name || !email || !role) {
-    return res.status(400).json({
-      message: "Os campos name, email e role são obrigatórios.",
+    if (!senhaValida(password)) {
+      return res.status(400).json({
+        message: "A senha deve ter no mínimo 6 caracteres.",
+      });
+    }
+
+    if (
+      typeof role !== "string" ||
+      !rolesValidas.includes(role.toUpperCase())
+    ) {
+      return res.status(400).json({
+        message: "Role inválida. Use ADMIN, CLIENT ou RECEPTION.",
+      });
+    }
+
+    const loginPasswordHash = await bcrypt.hash(password, 10);
+
+    const novoUsuario = new Usuario({
+      name,
+      email,
+      login_password_hash: loginPasswordHash,
+      role: role.toUpperCase(),
+      cpf_cnpj: cpf_cnpj || null,
+      company_id: company_id || null,
+    });
+
+    await novoUsuario.save();
+
+    res.status(201).json(usuarioSemSenhas(novoUsuario));
+  } catch (error) {
+    res.status(500).json({
+      message: "Erro ao cadastrar usuário.",
+      error: error.message,
     });
   }
-
-  if (!rolesValidas.includes(role.toUpperCase())) {
-    return res.status(400).json({
-      message: "Role inválida. Use ADMIN, CLIENT ou RECEPTION.",
-    });
-  }
-
-  const newUser = {
-    id: uuidv4(),
-    name,
-    email,
-    password_hash: password_hash || "",
-    role: role.toUpperCase(),
-    cpf_cnpj: cpf_cnpj || null,
-    company_id: company_id || null,
-    created_at: new Date().toISOString(),
-  };
-
-  users.push(newUser);
-
-  saveData(users);
-
-  res.status(201).json(newUser);
 });
 
 /**
@@ -255,6 +301,8 @@ router.post("/", (req, res) => {
  *   put:
  *     summary: Atualiza um usuário existente
  *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -272,44 +320,67 @@ router.post("/", (req, res) => {
  *         description: Usuário atualizado com sucesso
  *       400:
  *         description: Dados inválidos
+ *       401:
+ *         description: Token ausente ou inválido
+ *       403:
+ *         description: Acesso permitido somente para ADMIN
  *       404:
  *         description: Usuário não encontrado
  */
-router.put("/:id", (req, res) => {
-  const users = readData();
+router.put("/:id", permissaoMiddleware("ADMIN"), async (req, res) => {
+  try {
+    const usuario = await Usuario.findOne({
+      id: req.params.id,
+    }).select("+login_password_hash");
 
-  const index = users.findIndex((u) => u.id === req.params.id);
+    if (!usuario) {
+      return res.status(404).json({
+        message: "Usuário não encontrado.",
+      });
+    }
 
-  if (index === -1) {
-    return res.status(404).json({
-      message: "Usuário não encontrado",
+    const { name, email, password, role, cpf_cnpj, company_id } = req.body;
+
+    const camposPermitidos = ["name", "email", "cpf_cnpj", "company_id"];
+
+    for (const campo of camposPermitidos) {
+      if (req.body[campo] !== undefined) {
+        usuario[campo] = req.body[campo];
+      }
+    }
+
+    if (role !== undefined) {
+      if (
+        typeof role !== "string" ||
+        !rolesValidas.includes(role.toUpperCase())
+      ) {
+        return res.status(400).json({
+          message: "Role inválida. Use ADMIN, CLIENT ou RECEPTION.",
+        });
+      }
+
+      usuario.role = role.toUpperCase();
+    }
+
+    if (password !== undefined) {
+      if (!senhaValida(password)) {
+        return res.status(400).json({
+          message: "A senha deve ter no mínimo 6 caracteres.",
+        });
+      }
+
+      usuario.login_password_hash = await bcrypt.hash(password, 10);
+    }
+
+    await usuario.save();
+
+    res.json(usuarioSemSenhas(usuario));
+  } catch (error) {
+    res.status(400).json({
+      message: "Erro ao atualizar usuário.",
+      error: error.message,
     });
   }
-
-  if (req.body.role && !rolesValidas.includes(req.body.role.toUpperCase())) {
-    return res.status(400).json({
-      message: "Role inválida. Use ADMIN, CLIENT ou RECEPTION.",
-    });
-  }
-
-  const updatedUser = {
-    ...users[index],
-    ...req.body,
-
-    role: req.body.role ? req.body.role.toUpperCase() : users[index].role,
-
-    // Não permite alterar o ID
-    id: users[index].id,
-
-    // Mantém a data original de criação
-    created_at: users[index].created_at,
-  };
-
-  users[index] = updatedUser;
-
-  saveData(users);
-
-  res.json(updatedUser);
 });
 
 /**
@@ -318,6 +389,8 @@ router.put("/:id", (req, res) => {
  *   delete:
  *     summary: Remove um usuário
  *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -327,28 +400,35 @@ router.put("/:id", (req, res) => {
  *     responses:
  *       200:
  *         description: Usuário removido com sucesso
+ *       401:
+ *         description: Token ausente ou inválido
+ *       403:
+ *         description: Acesso permitido somente para ADMIN
  *       404:
  *         description: Usuário não encontrado
  */
-router.delete("/:id", (req, res) => {
-  const users = readData();
+router.delete("/:id", permissaoMiddleware("ADMIN"), async (req, res) => {
+  try {
+    const usuarioRemovido = await Usuario.findOneAndDelete({
+      id: req.params.id,
+    });
 
-  const index = users.findIndex((u) => u.id === req.params.id);
+    if (!usuarioRemovido) {
+      return res.status(404).json({
+        message: "Usuário não encontrado.",
+      });
+    }
 
-  if (index === -1) {
-    return res.status(404).json({
-      message: "Usuário não encontrado",
+    res.json({
+      message: "Usuário removido com sucesso.",
+      user: usuarioSemSenhas(usuarioRemovido),
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Erro ao remover usuário.",
+      error: error.message,
     });
   }
-
-  const deletedUser = users.splice(index, 1);
-
-  saveData(users);
-
-  res.json({
-    message: "Usuário removido com sucesso",
-    user: deletedUser[0],
-  });
 });
 
 module.exports = router;

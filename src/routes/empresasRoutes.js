@@ -1,31 +1,42 @@
-const express = require('express')
-const router = express.Router()
-const { v4: uuidv4 } = require('uuid')
-const fs = require('fs')
-const path = require('path')
+const express = require("express");
+const router = express.Router();
+const Empresa = require("../models/Empresa");
 
-const DB_PATH = path.join(__dirname, '..', 'db', 'empresasDB.json')
+const authMiddleware = require("../middlewares/authMiddleware");
+const permissaoMiddleware = require("../middlewares/permissaoMiddleware");
 
-function lerEmpresasDB() {
-  try {
-    const conteudo = fs.readFileSync(DB_PATH, 'utf-8')
-    if (!conteudo.trim()) return []
-    return JSON.parse(conteudo)
-  } catch (err) {
-    console.error('Erro ao ler empresasDB:', err.message)
-    return []
-  }
-}
+// Somente ADMIN pode acessar o módulo de empresas.
+router.use(authMiddleware, permissaoMiddleware("ADMIN"));
 
-function salvarEmpresasDB() {
-  fs.writeFileSync(DB_PATH, JSON.stringify(empresasDB, null, 2), 'utf-8')
-}
-
-let empresasDB = lerEmpresasDB()
-
-// Remove pontos, barra e traço para comparar CNPJs independente da formatação
+// Remove pontos, barras, traços e outros caracteres do CNPJ
 function normalizarCNPJ(cnpj) {
-  return String(cnpj).replace(/\D/g, '')
+  return String(cnpj || "").replace(/\D/g, "");
+}
+
+// Verifica se todos os campos obrigatórios foram informados
+function dadosValidos(dados) {
+  return (
+    dados.Nome_corporativo &&
+    dados.Nome_Trade &&
+    dados.CNPJ &&
+    dados.telefone &&
+    dados.Data_criacao
+  );
+}
+
+// Trata duplicidade de CNPJ
+function tratarErro(res, erro) {
+  console.error("Erro na rota de empresas:", erro);
+
+  if (erro.code === 11000) {
+    return res.status(409).json({
+      message: "Já existe uma empresa com este CNPJ",
+    });
+  }
+
+  return res.status(500).json({
+    message: "Erro interno ao processar empresa",
+  });
 }
 
 /**
@@ -35,7 +46,6 @@ function normalizarCNPJ(cnpj) {
  *     Empresa:
  *       type: object
  *       required:
- *         - ID
  *         - Nome_corporativo
  *         - Nome_Trade
  *         - CNPJ
@@ -45,24 +55,17 @@ function normalizarCNPJ(cnpj) {
  *         ID:
  *           type: string
  *           format: uuid
- *           description: ID da empresa
  *         Nome_corporativo:
  *           type: string
- *           description: Nome corporativo da empresa
  *         Nome_Trade:
  *           type: string
- *           description: Nome de trade da empresa
  *         CNPJ:
  *           type: string
- *           description: CNPJ da empresa
  *         telefone:
  *           type: string
- *           description: Telefone da empresa
  *         Data_criacao:
  *           type: string
- *           description: Data de criação da empresa
  *       example:
- *         ID: 1
  *         Nome_corporativo: Empresa Exemplo
  *         Nome_Trade: Exemplo
  *         CNPJ: 12.345.678/0001-90
@@ -75,7 +78,6 @@ function normalizarCNPJ(cnpj) {
  * tags:
  *   name: Empresas
  *   description: API de Controle de Empresas
- *     **Por José Henrique Pereira Pimentel**
  */
 
 /**
@@ -87,18 +89,15 @@ function normalizarCNPJ(cnpj) {
  *     responses:
  *       200:
  *         description: Lista de empresas
- *         content:
- *           application/json:
- *             schema:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/Empresa'
  */
-// Retornar todas as empresas
-router.get('/', (req, res) => {
-  console.log("getroute")
-  res.json(empresasDB)
-})
+router.get("/", async (req, res) => {
+  try {
+    const empresas = await Empresa.find();
+    res.json(empresas);
+  } catch (erro) {
+    tratarErro(res, erro);
+  }
+});
 
 /**
  * @swagger
@@ -112,33 +111,34 @@ router.get('/', (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: Nome corporativo ou Nome Trade (busca parcial)
  *     responses:
  *       200:
  *         description: Lista de empresas encontradas
- *         content:
- *           application/json:
- *             schema:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/Empresa'
  *       404:
  *         description: Nenhuma empresa encontrada
  */
-router.get('/nome/:nome', (req, res) => {
-  const termo = req.params.nome.toLowerCase()
+router.get("/nome/:nome", async (req, res) => {
+  try {
+    const termo = req.params.nome;
 
-  const resultado = empresasDB.filter(emp =>
-    emp.Nome_corporativo.toLowerCase().includes(termo) ||
-    emp.Nome_Trade.toLowerCase().includes(termo)
-  )
+    const empresas = await Empresa.find({
+      $or: [
+        { Nome_corporativo: { $regex: termo, $options: "i" } },
+        { Nome_Trade: { $regex: termo, $options: "i" } },
+      ],
+    });
 
-  if (resultado.length === 0) {
-    return res.status(404).json({ message: 'Nenhuma empresa encontrada' })
+    if (empresas.length === 0) {
+      return res.status(404).json({
+        message: "Nenhuma empresa encontrada",
+      });
+    }
+
+    res.json(empresas);
+  } catch (erro) {
+    tratarErro(res, erro);
   }
-
-  res.json(resultado)
-})
+});
 
 /**
  * @swagger
@@ -149,30 +149,30 @@ router.get('/nome/:nome', (req, res) => {
  *     parameters:
  *       - in: path
  *         name: id
+ *         required: true
  *         schema:
  *           type: string
- *         required: true
- *         description: ID da empresa
  *     responses:
  *       200:
- *         description: Uma empresa pelo ID
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Empresa'
+ *         description: Empresa encontrada
  *       404:
  *         description: Empresa não encontrada
  */
-router.get('/:id', (req, res) => {
-  const id = req.params.id
-  var empresa = empresasDB.find(emp => emp.ID === id)
+router.get("/:id", async (req, res) => {
+  try {
+    const empresa = await Empresa.findOne({ ID: req.params.id });
 
-  if (!empresa) {
-    return res.status(404).json({ message: 'Empresa não encontrada' })
+    if (!empresa) {
+      return res.status(404).json({
+        message: "Empresa não encontrada",
+      });
+    }
+
+    res.json(empresa);
+  } catch (erro) {
+    tratarErro(res, erro);
   }
-
-  res.json(empresa)
-})
+});
 
 /**
  * @swagger
@@ -189,43 +189,63 @@ router.get('/:id', (req, res) => {
  *     responses:
  *       200:
  *         description: Empresa criada com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Empresa'
  *       400:
- *         description: Dados da empresa inválidos
+ *         description: Dados inválidos
  *       409:
- *         description: Já existe uma empresa com este CNPJ
+ *         description: CNPJ já cadastrado
  */
-router.post('/', (req, res) => {
-  const { Nome_corporativo, Nome_Trade, CNPJ, telefone, Data_criacao } = req.body
+router.post("/", async (req, res) => {
+  try {
+    const { Nome_corporativo, Nome_Trade, CNPJ, telefone, Data_criacao } =
+      req.body;
 
-  if (!Nome_corporativo || !Nome_Trade || !CNPJ || !telefone || !Data_criacao) {
-    return res.status(400).json({ message: 'Dados da empresa inválidos' })
+    if (
+      !dadosValidos({
+        Nome_corporativo,
+        Nome_Trade,
+        CNPJ,
+        telefone,
+        Data_criacao,
+      })
+    ) {
+      return res.status(400).json({
+        message: "Dados da empresa inválidos",
+      });
+    }
+
+    const cnpjNormalizado = normalizarCNPJ(CNPJ);
+
+    if (!cnpjNormalizado) {
+      return res.status(400).json({
+        message: "CNPJ inválido",
+      });
+    }
+
+    const empresa = new Empresa({
+      Nome_corporativo,
+      Nome_Trade,
+      CNPJ,
+      CNPJ_normalizado: cnpjNormalizado,
+      telefone,
+      Data_criacao,
+    });
+
+    await empresa.save();
+
+    res.json({
+      message: "Empresa criada com sucesso",
+      empresa,
+    });
+  } catch (erro) {
+    if (erro.name === "ValidationError") {
+      return res.status(400).json({
+        message: "Dados da empresa inválidos",
+      });
+    }
+
+    tratarErro(res, erro);
   }
-
-  const cnpjNormalizado = normalizarCNPJ(CNPJ)
-  const cnpjExiste = empresasDB.some(
-    emp => normalizarCNPJ(emp.CNPJ) === cnpjNormalizado
-  )
-
-  if (cnpjExiste) {
-    return res.status(409).json({ message: 'Já existe uma empresa com este CNPJ' })
-  }
-
-  empresasDB.push({
-    ID: uuidv4(),
-    Nome_corporativo,
-    Nome_Trade,
-    CNPJ,
-    telefone,
-    Data_criacao
-  })
-
-  salvarEmpresasDB()
-  res.json({ message: 'Empresa criada com sucesso' })
-})
+});
 
 /**
  * @swagger
@@ -239,56 +259,85 @@ router.post('/', (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *           format: uuid
  *     requestBody:
  *       required: true
  *       content:
  *         application/json:
  *           schema:
- *             type: object
+ *             $ref: '#/components/schemas/Empresa'
  *     responses:
  *       200:
  *         description: Empresa atualizada
  *       400:
- *         description: Dados da empresa inválidos
+ *         description: Dados inválidos
  *       404:
  *         description: Empresa não encontrada
  *       409:
- *         description: Já existe uma empresa com este CNPJ
+ *         description: CNPJ já cadastrado
  */
-router.put('/:id', (req, res) => {
-  const id = req.params.id
-  const novaEmpresa = req.body
+router.put("/:id", async (req, res) => {
+  try {
+    const { Nome_corporativo, Nome_Trade, CNPJ, telefone, Data_criacao } =
+      req.body;
 
-  const empresaAtual = empresasDB.find(emp => emp.ID === id)
+    if (
+      !dadosValidos({
+        Nome_corporativo,
+        Nome_Trade,
+        CNPJ,
+        telefone,
+        Data_criacao,
+      })
+    ) {
+      return res.status(400).json({
+        message: "Dados da empresa inválidos",
+      });
+    }
 
-  if (!empresaAtual) {
-    return res.status(404).json({ message: 'Empresa não encontrada' })
+    const cnpjNormalizado = normalizarCNPJ(CNPJ);
+
+    if (!cnpjNormalizado) {
+      return res.status(400).json({
+        message: "CNPJ inválido",
+      });
+    }
+
+    const empresa = await Empresa.findOneAndUpdate(
+      { ID: req.params.id },
+      {
+        Nome_corporativo,
+        Nome_Trade,
+        CNPJ,
+        CNPJ_normalizado: cnpjNormalizado,
+        telefone,
+        Data_criacao,
+      },
+      {
+        new: true,
+        runValidators: true,
+      },
+    );
+
+    if (!empresa) {
+      return res.status(404).json({
+        message: "Empresa não encontrada",
+      });
+    }
+
+    res.json({
+      message: "Empresa atualizada com sucesso",
+      empresa,
+    });
+  } catch (erro) {
+    if (erro.name === "ValidationError") {
+      return res.status(400).json({
+        message: "Dados da empresa inválidos",
+      });
+    }
+
+    tratarErro(res, erro);
   }
-
-  if (!novaEmpresa.Nome_corporativo || !novaEmpresa.Nome_Trade || !novaEmpresa.CNPJ || !novaEmpresa.telefone || !novaEmpresa.Data_criacao) {
-    return res.status(400).json({ message: 'Dados da empresa inválidos' })
-  }
-
-  // Impede CNPJ repetido em outra empresa (ignora a própria)
-  const cnpjNormalizado = normalizarCNPJ(novaEmpresa.CNPJ)
-  const cnpjEmUso = empresasDB.some(
-    emp => emp.ID !== id && normalizarCNPJ(emp.CNPJ) === cnpjNormalizado
-  )
-
-  if (cnpjEmUso) {
-    return res.status(409).json({ message: 'Já existe uma empresa com este CNPJ' })
-  }
-
-  empresaAtual.Nome_corporativo = novaEmpresa.Nome_corporativo
-  empresaAtual.Nome_Trade = novaEmpresa.Nome_Trade
-  empresaAtual.CNPJ = novaEmpresa.CNPJ
-  empresaAtual.telefone = novaEmpresa.telefone
-  empresaAtual.Data_criacao = novaEmpresa.Data_criacao
-
-  salvarEmpresasDB()
-  res.json({ message: 'Empresa atualizada com sucesso' })
-})
+});
 
 /**
  * @swagger
@@ -302,24 +351,30 @@ router.put('/:id', (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *           format: uuid
  *     responses:
  *       200:
  *         description: Empresa excluída com sucesso
  *       404:
  *         description: Empresa não encontrada
  */
-router.delete('/:id', (req, res) => {
-  const id = req.params.id
-  const empresaIndex = empresasDB.findIndex(emp => emp.ID === id)
+router.delete("/:id", async (req, res) => {
+  try {
+    const empresa = await Empresa.findOneAndDelete({
+      ID: req.params.id,
+    });
 
-  if (empresaIndex === -1) {
-    return res.status(404).json({ message: 'Empresa não encontrada' })
+    if (!empresa) {
+      return res.status(404).json({
+        message: "Empresa não encontrada",
+      });
+    }
+
+    res.json({
+      message: "Empresa excluída com sucesso",
+    });
+  } catch (erro) {
+    tratarErro(res, erro);
   }
+});
 
-  empresasDB.splice(empresaIndex, 1)
-  salvarEmpresasDB()
-  res.json({ message: 'Empresa excluída com sucesso' })
-})
-
-module.exports = router
+module.exports = router;

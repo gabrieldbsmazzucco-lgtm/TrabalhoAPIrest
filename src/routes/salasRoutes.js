@@ -1,31 +1,32 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const { v4: uuidv4 } = require("uuid");
+const Sala = require("../models/Sala");
+const Disponibilidade = require("../models/Disponibilidade");
+const Reserva = require("../models/Reserva");
+const { randomUUID } = require("crypto");
+
+const authMiddleware = require("../middlewares/authMiddleware");
+const permissaoMiddleware = require("../middlewares/permissaoMiddleware");
 
 const router = express.Router();
 
-const dbPath = path.join(__dirname, "../db/salasDB.json");
-
 const tiposValidos = ["COWORKING", "LAB", "MEETING_ROOM"];
-
-// funções auxiliares
-function readData() {
-  try {
-    const data = fs.readFileSync(dbPath, "utf-8");
-    if (!data.trim()) return [];
-    return JSON.parse(data);
-  } catch (error) {
-    return [];
-  }
-}
-
-function saveData(data) {
-  fs.writeFileSync(dbPath, JSON.stringify(data, null, 2), "utf-8");
-}
 
 function capacidadeValida(capacity) {
   return Number.isInteger(capacity) && capacity > 0;
+}
+
+function tratarErro(res, erro) {
+  console.error("Erro nas salas:", erro);
+
+  if (erro.code === 11000) {
+    return res.status(409).json({
+      message: "Já existe uma sala com esse ID.",
+    });
+  }
+
+  return res.status(500).json({
+    message: "Erro interno ao processar a sala.",
+  });
 }
 
 /**
@@ -41,23 +42,17 @@ function capacidadeValida(capacity) {
  *       properties:
  *         id:
  *           type: string
- *           description: ID gerado automaticamente (UUID)
  *         name:
  *           type: string
- *           description: Nome da sala
  *         type:
  *           type: string
  *           enum: [COWORKING, LAB, MEETING_ROOM]
- *           description: Tipo do espaço
  *         capacity:
  *           type: integer
- *           description: Capacidade de pessoas
  *         description:
  *           type: string
- *           description: Descrição da sala
  *         is_active:
  *           type: boolean
- *           description: Indica se a sala está ativa para reservas
  *       example:
  *         id: "a1b2c3d4-1111-4222-8333-444455556666"
  *         name: "Sala de Reunião 1"
@@ -75,20 +70,25 @@ function capacidadeValida(capacity) {
  *       properties:
  *         name:
  *           type: string
+ *           example: "Sala de Reunião 2"
  *         type:
  *           type: string
  *           enum: [COWORKING, LAB, MEETING_ROOM]
+ *           example: "MEETING_ROOM"
  *         capacity:
  *           type: integer
+ *           example: 12
  *         description:
  *           type: string
+ *           example: "Sala com mesa de reuniões e projetor"
  *         is_active:
  *           type: boolean
+ *           example: true
  *       example:
- *         name: "Laboratório de Informática"
- *         type: "LAB"
- *         capacity: 25
- *         description: "Laboratório com 25 computadores"
+ *         name: "Sala de Reunião 2"
+ *         type: "MEETING_ROOM"
+ *         capacity: 12
+ *         description: "Sala com mesa de reuniões e projetor"
  *         is_active: true
  *
  *     SalaUpdateInput:
@@ -96,26 +96,33 @@ function capacidadeValida(capacity) {
  *       properties:
  *         name:
  *           type: string
+ *           example: "Sala de Reunião 2 - Atualizada"
  *         type:
  *           type: string
  *           enum: [COWORKING, LAB, MEETING_ROOM]
+ *           example: "MEETING_ROOM"
  *         capacity:
  *           type: integer
+ *           example: 15
  *         description:
  *           type: string
+ *           example: "Sala atualizada com capacidade para 15 pessoas"
  *         is_active:
  *           type: boolean
+ *           example: true
  *       example:
- *         name: "Laboratório de Informática (Atualizado)"
- *         capacity: 30
- *         is_active: false
+ *         name: "Sala de Reunião 2 - Atualizada"
+ *         type: "MEETING_ROOM"
+ *         capacity: 15
+ *         description: "Sala atualizada com capacidade para 15 pessoas"
+ *         is_active: true
  */
 
 /**
  * @swagger
  * tags:
- *   name: Salas
- *   description: API de controle de salas/espaços (spaces)
+ *   - name: Salas
+ *     description: API de controle de salas/espaços (spaces)
  */
 
 /**
@@ -129,48 +136,54 @@ function capacidadeValida(capacity) {
  *         name: name
  *         schema:
  *           type: string
- *         description: Filtrar por nome (busca parcial)
  *       - in: query
  *         name: type
  *         schema:
  *           type: string
  *           enum: [COWORKING, LAB, MEETING_ROOM]
- *         description: Filtrar por tipo
  *       - in: query
  *         name: is_active
  *         schema:
  *           type: boolean
- *         description: Filtrar por salas ativas/inativas
  *     responses:
  *       200:
  *         description: Lista de salas obtida com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/Sala'
  */
-router.get("/", (req, res) => {
-  let salas = readData();
-  const { name, type, is_active } = req.query;
+router.get(
+  "/",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION", "CLIENT"),
+  async (req, res) => {
+    try {
+      const { name, type, is_active } = req.query;
+      const filtro = {};
 
-  if (name) {
-    salas = salas.filter((s) =>
-      s.name.toLowerCase().includes(name.toLowerCase()),
-    );
-  }
+      if (name) {
+        filtro.name = { $regex: name, $options: "i" };
+      }
 
-  if (type) {
-    salas = salas.filter((s) => s.type === type.toUpperCase());
-  }
+      if (type) {
+        filtro.type = String(type).toUpperCase();
+      }
 
-  if (is_active !== undefined) {
-    salas = salas.filter((s) => String(s.is_active) === is_active);
-  }
+      if (is_active !== undefined) {
+        if (is_active !== "true" && is_active !== "false") {
+          return res.status(400).json({
+            message: "O filtro is_active deve ser true ou false.",
+          });
+        }
 
-  res.json(salas);
-});
+        filtro.is_active = is_active === "true";
+      }
+
+      const salas = await Sala.find(filtro);
+
+      return res.json(salas);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 /**
  * @swagger
@@ -184,33 +197,39 @@ router.get("/", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da sala
  *     responses:
  *       200:
  *         description: Sala encontrada
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Sala'
  *       404:
  *         description: Sala não encontrada
  */
-router.get("/:id", (req, res) => {
-  const salas = readData();
-  const sala = salas.find((s) => s.id === req.params.id);
+router.get(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION", "CLIENT"),
+  async (req, res) => {
+    try {
+      const sala = await Sala.findOne({ id: req.params.id });
 
-  if (!sala) {
-    return res.status(404).json({ message: "Sala não encontrada" });
-  }
+      if (!sala) {
+        return res.status(404).json({
+          message: "Sala não encontrada",
+        });
+      }
 
-  res.json(sala);
-});
+      return res.json(sala);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 /**
  * @swagger
  * /salas:
  *   post:
  *     summary: Cria uma nova sala
+ *     description: Cria uma sala com ID gerado automaticamente.
  *     tags: [Salas]
  *     requestBody:
  *       required: true
@@ -221,55 +240,59 @@ router.get("/:id", (req, res) => {
  *     responses:
  *       201:
  *         description: Sala criada com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Sala'
  *       400:
- *         description: Dados inválidos ou campos obrigatórios ausentes
+ *         description: Dados inválidos
  */
-router.post("/", (req, res) => {
-  const salas = readData();
-  const { name, type, capacity, description, is_active } = req.body;
+router.post(
+  "/",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION"),
+  async (req, res) => {
+    try {
+      const { name, type, capacity, description, is_active } = req.body;
 
-  if (!name || !type || capacity === undefined) {
-    return res.status(400).json({
-      message: "Os campos name, type e capacity são obrigatórios.",
-    });
-  }
+      if (!name || !type || capacity === undefined) {
+        return res.status(400).json({
+          message: "Os campos name, type e capacity são obrigatórios.",
+        });
+      }
 
-  if (!tiposValidos.includes(String(type).toUpperCase())) {
-    return res.status(400).json({
-      message: "Tipo inválido. Use COWORKING, LAB ou MEETING_ROOM.",
-    });
-  }
+      if (!tiposValidos.includes(String(type).toUpperCase())) {
+        return res.status(400).json({
+          message: "Tipo inválido. Use COWORKING, LAB ou MEETING_ROOM.",
+        });
+      }
 
-  if (!capacidadeValida(capacity)) {
-    return res.status(400).json({
-      message: "A capacidade deve ser um número inteiro maior que zero.",
-    });
-  }
+      if (!capacidadeValida(capacity)) {
+        return res.status(400).json({
+          message: "A capacidade deve ser um número inteiro maior que zero.",
+        });
+      }
 
-  const novaSala = {
-    id: uuidv4(),
-    name,
-    type: String(type).toUpperCase(),
-    capacity,
-    description: description || "",
-    is_active: is_active !== undefined ? Boolean(is_active) : true,
-  };
+      const novaSala = new Sala({
+        id: randomUUID(),
+        name,
+        type: String(type).toUpperCase(),
+        capacity,
+        description: description || "",
+        is_active: is_active !== undefined ? is_active : true,
+      });
 
-  salas.push(novaSala);
-  saveData(salas);
+      await novaSala.save();
 
-  res.status(201).json(novaSala);
-});
+      return res.status(201).json(novaSala);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 /**
  * @swagger
  * /salas/{id}:
  *   put:
  *     summary: Atualiza uma sala existente
+ *     description: Atualiza os campos enviados para a sala identificada pelo ID.
  *     tags: [Salas]
  *     parameters:
  *       - in: path
@@ -277,7 +300,7 @@ router.post("/", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da sala
+ *         example: "a1b2c3d4-1111-4222-8333-444455556666"
  *     requestBody:
  *       required: true
  *       content:
@@ -287,56 +310,68 @@ router.post("/", (req, res) => {
  *     responses:
  *       200:
  *         description: Sala atualizada com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Sala'
  *       400:
  *         description: Dados inválidos
  *       404:
  *         description: Sala não encontrada
  */
-router.put("/:id", (req, res) => {
-  const salas = readData();
-  const index = salas.findIndex((s) => s.id === req.params.id);
+router.put(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION"),
+  async (req, res) => {
+    try {
+      const { type, capacity } = req.body;
 
-  if (index === -1) {
-    return res.status(404).json({ message: "Sala não encontrada" });
-  }
+      if (type && !tiposValidos.includes(String(type).toUpperCase())) {
+        return res.status(400).json({
+          message: "Tipo inválido. Use COWORKING, LAB ou MEETING_ROOM.",
+        });
+      }
 
-  const { type, capacity } = req.body;
+      if (capacity !== undefined && !capacidadeValida(capacity)) {
+        return res.status(400).json({
+          message: "A capacidade deve ser um número inteiro maior que zero.",
+        });
+      }
 
-  if (type && !tiposValidos.includes(String(type).toUpperCase())) {
-    return res.status(400).json({
-      message: "Tipo inválido. Use COWORKING, LAB ou MEETING_ROOM.",
-    });
-  }
+      const dadosAtualizados = { ...req.body };
 
-  if (capacity !== undefined && !capacidadeValida(capacity)) {
-    return res.status(400).json({
-      message: "A capacidade deve ser um número inteiro maior que zero.",
-    });
-  }
+      delete dadosAtualizados.id;
+      delete dadosAtualizados._id;
 
-  const salaAtualizada = {
-    ...salas[index],
-    ...req.body,
-    type: type ? String(type).toUpperCase() : salas[index].type,
+      if (type) {
+        dadosAtualizados.type = String(type).toUpperCase();
+      }
 
-    id: salas[index].id,
-  };
+      const salaAtualizada = await Sala.findOneAndUpdate(
+        { id: req.params.id },
+        dadosAtualizados,
+        {
+          new: true,
+          runValidators: true,
+        },
+      );
 
-  salas[index] = salaAtualizada;
-  saveData(salas);
+      if (!salaAtualizada) {
+        return res.status(404).json({
+          message: "Sala não encontrada",
+        });
+      }
 
-  res.json(salaAtualizada);
-});
+      return res.json(salaAtualizada);
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 /**
  * @swagger
  * /salas/{id}:
  *   delete:
- *     summary: Remove uma sala
+ *     summary: Exclui ou desativa uma sala
+ *     description: Exclui permanentemente se não houver disponibilidades ou reservas vinculadas. Caso existam, apenas desativa.
  *     tags: [Salas]
  *     parameters:
  *       - in: path
@@ -344,28 +379,74 @@ router.put("/:id", (req, res) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: ID da sala
  *     responses:
  *       200:
- *         description: Sala removida com sucesso
+ *         description: Sala excluída ou desativada com sucesso
  *       404:
  *         description: Sala não encontrada
  */
-router.delete("/:id", (req, res) => {
-  const salas = readData();
-  const index = salas.findIndex((s) => s.id === req.params.id);
+router.delete(
+  "/:id",
+  authMiddleware,
+  permissaoMiddleware("ADMIN", "RECEPTION"),
+  async (req, res) => {
+    try {
+      const sala = await Sala.findOne({
+        id: req.params.id,
+      });
 
-  if (index === -1) {
-    return res.status(404).json({ message: "Sala não encontrada" });
-  }
+      if (!sala) {
+        return res.status(404).json({
+          message: "Sala não encontrada.",
+        });
+      }
 
-  const salaRemovida = salas.splice(index, 1);
-  saveData(salas);
+      // Verifica se existem disponibilidades vinculadas.
+      const disponibilidadeExistente = await Disponibilidade.findOne({
+        space_id: sala.id,
+      });
 
-  res.json({
-    message: "Sala removida com sucesso",
-    sala: salaRemovida[0],
-  });
-});
+      // Verifica se existem reservas vinculadas.
+      const reservaExistente = await Reserva.findOne({
+        space_id: sala.id,
+      });
+
+      // Se houver qualquer vínculo, apenas desativa a sala.
+      if (disponibilidadeExistente || reservaExistente) {
+        if (!sala.is_active) {
+          return res.json({
+            message: "A sala já está inativa.",
+            acao: "INATIVA",
+            sala,
+          });
+        }
+
+        sala.is_active = false;
+
+        await sala.save();
+
+        return res.json({
+          message:
+            "A sala foi desativada porque possui disponibilidades ou reservas vinculadas.",
+          acao: "DESATIVADA",
+          sala,
+        });
+      }
+
+      // Se não houver vínculos, exclui permanentemente.
+      await Sala.findOneAndDelete({
+        id: sala.id,
+      });
+
+      return res.json({
+        message: "Sala excluída permanentemente.",
+        acao: "EXCLUIDA",
+        sala,
+      });
+    } catch (erro) {
+      return tratarErro(res, erro);
+    }
+  },
+);
 
 module.exports = router;
